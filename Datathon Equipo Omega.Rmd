@@ -1,0 +1,774 @@
+---
+title: "<h1 style='text-align:center; color:red;'>Datathon</h1>"
+subtitle: "<h3 style='text-align:center; color:gold;'>Equipo Omega</h3>"
+output:
+  html_document:
+    theme: journal
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+<p align="center">
+  <img src="/Users/Cesar/Desktop/DT/oxxo.gif" width="300">
+</p>
+
+<p style="text-align:center;">
+  En este análisis el equipo Omega exploramos datos de tiendas OXXOs<br>
+  para detectar patrones de tiendas exitosas a partir de nuevas variables <br><br>
+  ¡Empecemos!
+</p>
+
+<h1 style="color:red;">Analisis Exploratorio de los Datos</h1>
+
+<h2 style="color:gold;">Carga de Librerias y Base de Datos</h2>
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(caret)
+library(xgboost)
+library(lightgbm)
+library(randomForest)
+library(rpart)
+library(nnet)
+library(ggplot2)
+library(reshape2)   
+library(e1071)    
+library(ggcorrplot)        
+library(skimr) 
+library(DataExplorer)
+library(naniar)       
+library(janitor)      
+library(GGally)    
+library(themis)
+library(MLmetrics)
+library(sf)
+library(gridExtra)
+library(broom)
+library(themis)   
+library(recipes)   
+library(xgboost)
+library(caret)
+library(MLmetrics)
+library(doParallel)
+library(caret)
+library(caretEnsemble)
+library(doParallel)
+
+df <- read.csv("oxxo_tiendas_ext.csv", stringsAsFactors = FALSE)
+```
+
+<h2 style="color:gold;">Columnas con nulos - Despues de imputar</h2>
+
+```{r missing_summary, message=FALSE, warning=FALSE}
+miss_var_summary(df) %>%
+  arrange(desc(pct_miss)) %>%
+  print(n = nrow(.))
+```
+
+<h2 style="color:gold;">Histogramas</h2>
+
+```{r histograms_separate, fig.width=6, fig.height=4, message=FALSE, warning=FALSE}
+num_cols <- names(df)[sapply(df, is.numeric)]
+for(col in num_cols){
+  ggplot(df, aes_string(x = col)) +
+    geom_histogram(bins = 30) +
+    theme_minimal() +
+    labs(title = paste("Histograma de", col)) -> p
+  print(p)
+}
+```
+
+<h2 style="color:gold;">Boxplots</h2>
+
+```{r boxplots_separate, fig.width=10, fig.height=4, message=FALSE, warning=FALSE}
+num_cols <- names(df)[sapply(df, is.numeric)]
+plots <- lapply(num_cols, function(col) {
+  ggplot(df, aes_string(x = "1", y = col)) +
+    geom_boxplot() +
+    theme_minimal() +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank()) +
+    labs(title=paste("Boxplot de", col))
+})
+for(i in seq(1, length(plots), by=4)){
+  grid.arrange(grobs=plots[i:min(i+3,length(plots))], ncol=4)
+}
+```
+<h2 style="color:gold;">Distancia al 7-Eleven</h2>
+
+```{r compute_dist_se_geosphere, message=FALSE, warning=FALSE}
+# Carga de librerías
+library(dplyr)
+library(geosphere)
+
+# Lectura de datos
+df  <- read.csv("oxxo_tiendas_ext.csv", stringsAsFactors = FALSE)
+sev <- read.csv("7eleven_mty_tamps.csv", stringsAsFactors = FALSE)
+
+# 1. Filtrar filas con coordenadas válidas
+df_geo  <- df  %>% filter(!is.na(latitud_num), !is.na(longitud_num))
+sev_geo <- sev %>% filter(!if_all(everything(), is.na))
+
+# 2. Encontrar dinámicamente los nombres de columnas de latitud/longitud en sev
+lat_col <- grep("lat", names(sev_geo),        ignore.case = TRUE, value = TRUE)[1]
+lng_col <- grep("lon|lng|long", names(sev_geo), ignore.case = TRUE, value = TRUE)[1]
+
+# 3. Preparar matriz de coordenadas de los 7-Eleven usando esos nombres
+coords_sev <- sev_geo %>%
+  select(
+    lng = all_of(lng_col),
+    lat = all_of(lat_col)
+  )
+
+# 4. Calcular dist_se (distancia mínima de cada OXXO al 7-Eleven más cercano)
+df_geo$dist_se <- apply(
+  df_geo[, c("longitud_num", "latitud_num")], 1,
+  function(row) {
+    origen   <- c(as.numeric(row["longitud_num"]), as.numeric(row["latitud_num"]))
+    destinos <- as.matrix(coords_sev)
+    dists    <- distHaversine(origen, destinos)
+    round(min(dists, na.rm = TRUE), 2)
+  }
+)
+
+df <- df %>%
+  left_join(df_geo %>% select(tienda_id, dist_se), by = "tienda_id")
+```
+
+<h2 style="color:gold;">ANOVA y Matriz de Correlacion</h2>
+
+```{r anova_con_transformaciones, fig.width=14, fig.height=12, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggcorrplot)
+
+# Preparamos df2: convertimos caracteres a factores, creamos log_dist_cerca y conservamos dist_se
+df2_trans <- df %>%
+  rename_all(tolower) %>%
+  mutate(
+    across(where(is.character), as.factor),
+    log_dist_cerca = log1p(dist_cerca)
+  ) %>%
+  select(-tienda_id, -latitud_num, -longitud_num)
+
+# Ajustamos el modelo ANOVA
+fit_trans <- aov(
+  venta_promedio ~ 
+    nivelsocioeconomico_des +
+    entorno_des +
+    segmento_maestro_desc +
+    lid_ubicacion_tienda +
+    plaza_cve +
+    mts2ventas_num +
+    puertasrefrig_num +
+    cajonesestacionamiento_num +
+    porcentaje_cumplimiento +
+    log_dist_cerca +  # transformada
+    dist_se         +  # sin transformar
+    num_escuelas +
+    num_abarrotes +
+    num_super +
+    num_farmacia +
+    num_oficina +
+    num_establecimientos +
+    num_gasolinera,
+  data = df2_trans
+)
+
+# Mostramos el output tradicional de ANOVA
+summary(fit_trans)
+
+# Matriz de correlación numérica (incluye log_dist_cerca y dist_se)
+numeric_vars <- df2_trans %>%
+  select(where(is.numeric)) %>%
+  select(-venta_promedio)
+
+M <- cor(numeric_vars, use = "pairwise.complete.obs")
+ggcorrplot(M, lab = TRUE)
+```
+
+<h2 style="color:gold;">Distribucion de Exitoso y no Exitoso</h2>
+
+```{r}
+df <- df %>%
+  mutate(exitoso = as.integer(porcentaje_cumplimiento > 91))
+tab <- table(df$exitoso)
+cat("Conteo:\n"); print(tab)
+cat("\n%:\n"); print(round(prop.table(tab)*100,2))
+write.csv(df, "df_exit.csv", row.names=FALSE)
+```
+<h2 style="color:gold;">Mapa Oxxos</h2>
+
+```{r map_leaflet, message=FALSE, warning=FALSE}
+# 1) Cargar librerías
+library(dplyr)
+library(leaflet)
+
+# 2) Leer datos
+df <- read.csv("oxxo_tiendas_ext.csv", stringsAsFactors = FALSE)
+
+# 3) Filtrar filas con coordenadas válidas
+df_map <- df %>%
+  filter(!is.na(latitud_num), !is.na(longitud_num))
+
+# 4) Construir el mapa
+leaflet(df_map) %>%
+  addTiles() %>%  # capa base OpenStreetMap
+  addCircleMarkers(
+    lng = ~longitud_num,
+    lat = ~latitud_num,
+    radius   = 4,
+    color    = "red",
+    stroke   = FALSE,
+    fillOpacity = 0.6,
+    popup    = ~paste0(
+      "<strong>Tienda:</strong> ", tienda_id, "<br/>",
+      "<strong>% Cumplimiento:</strong> ", porcentaje_cumplimiento, "%"
+    )
+  ) %>%
+  setView(
+    lng = mean(df_map$longitud_num, na.rm=TRUE),
+    lat = mean(df_map$latitud_num, na.rm=TRUE),
+    zoom = 7
+  )
+
+```
+
+<h2 style="color:gold;">Mapa 7-Eleven</h2>
+
+```{r map_7eleven, message=FALSE, warning=FALSE}
+library(dplyr)
+library(leaflet)
+
+# 1) Leer tu segundo dataset (ajusta la ruta/nombre de archivo)
+df7e <- read.csv("7eleven_mty_tamps.csv", stringsAsFactors = FALSE)
+
+# 2) Filtrar filas con coordenadas válidas
+df7e <- df7e %>%
+  filter(!is.na(lat), !is.na(lng))
+
+# 3) Crear el mapa con puntos verdes
+leaflet(df7e) %>%
+  addTiles() %>% 
+  addCircleMarkers(
+    lng         = ~lng,
+    lat         = ~lat,
+    radius      = 5,
+    color       = "darkgreen",
+    fillColor   = "green",
+    fillOpacity = 0.7,
+    stroke      = TRUE,
+    popup       = ~paste0(
+      "<strong>", name, "</strong><br/>",
+      address, "<br/>",
+      "CP buscado: ", postal_code_searched
+    )
+  ) %>%
+  setView(
+    lng  = mean(df7e$lng, na.rm = TRUE),
+    lat  = mean(df7e$lat, na.rm = TRUE),
+    zoom = 7
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h1 style="color:red;">Modelos Predictivos</h1>
+
+<h2 style="color:gold;">Creacion de variable a predecir y preparacion</h2>
+
+```{r setup_f1_smote, message=FALSE, warning=FALSE}
+# Carga de librerías
+library(dplyr)
+library(tidyr)
+library(geosphere)
+library(caret)
+library(recipes)
+library(themis)
+library(MLmetrics)
+
+# 1) Leer datos y crear variable objetivo + log_dist_cerca
+df <- read.csv("oxxo_tiendas_ext.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    exitoso         = if_else(porcentaje_cumplimiento > 91, "Yes", "No"),
+    exitoso         = factor(exitoso, levels = c("No","Yes")),
+    log_dist_cerca  = log1p(dist_cerca)
+  )
+
+# 2) Leer 7-Eleven y calcular dist_se con Haversine
+sev <- read.csv("7eleven_mty_tamps.csv", stringsAsFactors = FALSE) %>%
+  filter(!is.na(lat), !is.na(lng))
+
+haversine <- function(lon1, lat1, lon2, lat2) {
+  to_rad <- pi/180
+  lon1 <- lon1 * to_rad; lat1 <- lat1 * to_rad
+  lon2 <- lon2 * to_rad; lat2 <- lat2 * to_rad
+  dlon <- lon2 - lon1; dlat <- lat2 - lat1
+  a <- sin(dlat/2)^2 + cos(lat1)*cos(lat2)*sin(dlon/2)^2
+  2 * 6371000 * asin(pmin(1, sqrt(a)))
+}
+
+coords_sev <- sev %>% select(lng, lat)
+
+df <- df %>%
+  filter(!is.na(latitud_num), !is.na(longitud_num)) %>%
+  rowwise() %>%
+  mutate(
+    dist_se = {
+      origen <- c(longitud_num, latitud_num)
+      dists  <- haversine(
+        lon1 = origen[1], lat1 = origen[2],
+        lon2 = coords_sev$lng, lat2 = coords_sev$lat
+      )
+      round(min(dists, na.rm = TRUE), 2)
+    }
+  ) %>%
+  ungroup()
+
+# 3) Dividir TRAIN/TEST
+train_df <- df %>% filter(dataset == "TRAIN")
+test_df  <- df %>% filter(dataset == "TEST")
+
+# 4) Target-encoding para categóricas
+seg_means <- train_df %>%
+  group_by(segmento_maestro_desc) %>%
+  summarise(enc_segmento = mean(exitoso == "Yes"), .groups = "drop")
+lid_means <- train_df %>%
+  group_by(lid_ubicacion_tienda) %>%
+  summarise(enc_lid = mean(exitoso == "Yes"), .groups = "drop")
+
+train_df <- train_df %>%
+  left_join(seg_means, by = "segmento_maestro_desc") %>%
+  left_join(lid_means,   by = "lid_ubicacion_tienda")
+test_df  <- test_df  %>%
+  left_join(seg_means, by = "segmento_maestro_desc") %>%
+  left_join(lid_means,   by = "lid_ubicacion_tienda")
+
+global_seg <- mean(train_df$enc_segmento, na.rm = TRUE)
+global_lid <- mean(train_df$enc_lid,       na.rm = TRUE)
+train_df <- train_df %>%
+  mutate(
+    enc_segmento = replace_na(enc_segmento, global_seg),
+    enc_lid      = replace_na(enc_lid,      global_lid)
+  )
+test_df  <- test_df  %>%
+  mutate(
+    enc_segmento = replace_na(enc_segmento, global_seg),
+    enc_lid      = replace_na(enc_lid,      global_lid)
+  )
+
+# 5) Socioeconómico ordinal
+niveles <- c("A","AB","B","BC","C","CD","D")
+train_df <- train_df %>%
+  mutate(
+    nivel_socio_ord = as.integer(
+      factor(nivelsocioeconomico_des, levels = niveles, ordered = TRUE)
+    )
+  )
+test_df <- test_df %>%
+  mutate(
+    nivel_socio_ord = as.integer(
+      factor(nivelsocioeconomico_des, levels = niveles, ordered = TRUE)
+    )
+  )
+
+# 6) Eliminar columnas meta e irrelevantes
+drops <- c(
+  "dataset","tienda_id","plaza_cve","latitud_num","longitud_num",
+  "venta_promedio","porcentaje_cumplimiento",
+  "nivelsocioeconomico_des","entorno_des",
+  "segmento_maestro_desc","lid_ubicacion_tienda",
+  "num_escuelas","dist_cerca"
+)
+train_df <- train_df %>% select(-any_of(drops))
+test_df  <- test_df  %>% select(-any_of(drops))
+
+# 7) Eliminar predictores constantes
+preds  <- setdiff(names(train_df), "exitoso")
+consts <- preds[sapply(train_df[preds], n_distinct) == 1]
+train_df <- train_df %>% select(-all_of(consts))
+test_df  <- test_df  %>% select(-all_of(consts))
+
+# 8) Recipe: SMOTE, dummies, centrar y escalar
+set.seed(123)
+rec <- recipe(exitoso ~ ., data = train_df) %>%
+  step_smote(exitoso) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  prep()
+
+train_proc <- bake(rec, new_data = NULL)
+test_proc  <- bake(rec, new_data = test_df)
+
+# 9) Separar X/y
+X_train <- train_proc %>% select(-exitoso)
+y_train <- train_proc$exitoso
+X_test  <- test_proc  %>% select(-exitoso)
+y_test  <- test_proc$exitoso
+
+# 9b) Para compatibilidad con los chunks existentes:
+X_train_scaled <- X_train
+X_test_scaled  <- X_test
+pos_lvl        <- "Yes"
+ctrl_acc       <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = defaultSummary,
+  savePredictions = "final"
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h2 style="color:gold;">Logistic Regression con Elastic Net (glmnet)</h2>
+
+
+```{r model_logistic_f1, message=FALSE, warning=FALSE} 
+# <h2 style="color:gold;">Logistic Regression con Elastic Net (glmnet)</h2>
+library(glmnet)
+library(caret)
+
+# Convertir a matriz para glmnet
+X_mat <- as.matrix(X_train)
+y_bin <- ifelse(y_train=="Yes",1,0)
+
+# Control CV
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = defaultSummary
+)
+
+# Entrenar Elastic Net optimizando Accuracy
+set.seed(123)
+grid <- expand.grid(
+  alpha = seq(0,1, length=5),
+  lambda = 10^seq(-4, 0, length=20)
+)
+model_glmnet <- train(
+  x         = X_train,
+  y         = y_train,
+  method    = "glmnet",
+  metric    = "Accuracy",
+  trControl = ctrl,
+  tuneGrid  = grid
+)
+
+# Evaluar en TEST
+probs_enet <- predict(model_glmnet, X_test, type="prob")[, "Yes"]
+best_t <- seq(0.1,0.9,0.01)[ which.max(sapply(seq(0.1,0.9,0.01), function(t)
+  mean(factor(ifelse(probs_enet>t,"Yes","No"),
+              levels=c("No","Yes")) == y_test)
+))]
+pred_enet <- factor(ifelse(probs_enet>best_t,"Yes","No"), levels=c("No","Yes"))
+cm_enet   <- confusionMatrix(pred_enet, y_test, positive="Yes")
+
+# Métricas
+cat("Elastic Net (α=",model_glmnet$bestTune$alpha,
+    ", λ=",model_glmnet$bestTune$lambda,")\n", sep="")
+cat("Best threshold:", best_t, "\n")
+cat("Accuracy:   ", round(cm_enet$overall["Accuracy"],   3), "\n")
+cat("Precision:  ", round(cm_enet$byClass["Pos Pred Value"], 3), "\n")
+cat("Sensitivity:", round(cm_enet$byClass["Sensitivity"],     3), "\n")
+cat("F1 Score:   ", round(F1_Score(y_test, pred_enet, positive="Yes"), 3), "\n")
+```
+
+<h2 style="color:gold;">K-Nearest Neighbors</h2>
+
+
+```{r model_knn_acc, message=FALSE, warning=FALSE}
+# 1) Entrenar KNN optimizando Accuracy
+model_knn_acc <- train(
+  x         = X_train_scaled,
+  y         = y_train,
+  method    = "knn",
+  metric    = "Accuracy",
+  trControl = ctrl_acc,
+  tuneLength= 5
+)
+
+# 2) Predecir probabilidades “Yes” en test
+probs_knn <- predict(model_knn_acc, X_test_scaled, type = "prob")[, pos_lvl]
+
+# 3) Buscar umbral que maximice Accuracy
+ths_knn  <- seq(0.1, 0.9, by = 0.01)
+accs_knn <- sapply(ths_knn, function(t) {
+  preds_t <- factor(ifelse(probs_knn > t, pos_lvl, "No"),
+                    levels = c("No","Yes"))
+  mean(preds_t == y_test)
+})
+best_t_knn <- ths_knn[which.max(accs_knn)]
+cat("KNN best threshold (Accuracy):", best_t_knn, "\n\n")
+
+# 4) Evaluación final
+pred_knn <- factor(ifelse(probs_knn > best_t_knn, pos_lvl, "No"),
+                   levels = c("No","Yes"))
+cm_knn   <- confusionMatrix(pred_knn, y_test, positive = pos_lvl)
+
+# 5) Métricas (Accuracy primero)
+cat("Accuracy:   ", round(cm_knn$overall["Accuracy"],  3), "\n")
+cat("Precision:  ", round(cm_knn$byClass["Pos Pred Value"], 3), "\n")
+cat("Sensitivity:", round(cm_knn$byClass["Sensitivity"],    3), "\n")
+cat("F1 Score:   ", round(F1_Score(y_test, pred_knn, positive = pos_lvl), 3), "\n")
+
+```
+
+<h2 style="color:gold;">Decision Tree</h2> 
+
+
+```{r model_tree_acc, message=FALSE, warning=FALSE}
+# 1) Entrenar árbol optimizando Accuracy
+model_tree_acc <- train(
+  x         = X_train_scaled,
+  y         = y_train,
+  method    = "rpart",
+  metric    = "Accuracy",
+  trControl = ctrl_acc,
+  tuneLength= 5
+)
+
+# 2) Predecir probabilidades “Yes” en test
+probs_tree <- predict(model_tree_acc, X_test_scaled, type = "prob")[, pos_lvl]
+
+# 3) Buscar umbral que maximice Accuracy
+ths_tree  <- seq(0.1, 0.9, by = 0.01)
+accs_tree <- sapply(ths_tree, function(t) {
+  preds_t <- factor(ifelse(probs_tree > t, pos_lvl, "No"),
+                    levels = c("No","Yes"))
+  mean(preds_t == y_test)
+})
+best_t_tree <- ths_tree[which.max(accs_tree)]
+cat("Tree best threshold (Accuracy):", best_t_tree, "\n\n")
+
+# 4) Evaluación final
+pred_tree <- factor(ifelse(probs_tree > best_t_tree, pos_lvl, "No"),
+                    levels = c("No","Yes"))
+cm_tree   <- confusionMatrix(pred_tree, y_test, positive = pos_lvl)
+
+# 5) Métricas (Accuracy primero)
+cat("Accuracy:   ", round(cm_tree$overall["Accuracy"],  3), "\n")
+cat("Precision:  ", round(cm_tree$byClass["Pos Pred Value"], 3), "\n")
+cat("Sensitivity:", round(cm_tree$byClass["Sensitivity"],    3), "\n")
+cat("F1 Score:   ", round(F1_Score(y_test, pred_tree, positive = pos_lvl), 3), "\n")
+```
+
+<h2 style="color:gold;">Random Forest</h2>
+
+
+```{r model_rf_f1, message=FALSE, warning=FALSE}
+
+# 1) Entrenar RF optimizando Accuracy
+model_rf_acc <- train(
+  x         = X_train_scaled,
+  y         = y_train,
+  method    = "rf",
+  metric    = "Accuracy",
+  trControl = ctrl_acc,
+  tuneLength= 5
+)
+
+# 2) Umbral
+probs_rf <- predict(model_rf_acc, X_test_scaled, type="prob")[, pos_lvl]
+ths_rf   <- seq(0.1,0.9,by=0.01)
+accs_rf  <- sapply(ths_rf, function(t){
+  preds <- factor(ifelse(probs_rf>t,pos_lvl,"No"), levels=c("No","Yes"))
+  mean(preds==y_test)
+})
+best_t_rf <- ths_rf[which.max(accs_rf)]
+cat("RF best threshold (Accuracy):", best_t_rf, "\n")
+
+# 3) Métricas
+pred_rf <- factor(ifelse(probs_rf>best_t_rf,pos_lvl,"No"), levels=c("No","Yes"))
+cm_rf   <- confusionMatrix(pred_rf, y_test, positive=pos_lvl)
+cat("Accuracy:", round(cm_rf$overall["Accuracy"],3), "\n")
+cat("Precision:", round(cm_rf$byClass["Pos Pred Value"],3), "\n")
+cat("Sensitivity:", round(cm_rf$byClass["Sensitivity"],3), "\n")
+cat("F1:", round(F1_Score(y_test,pred_rf,positive=pos_lvl),3), "\n")
+
+```
+
+<h2 style="color:gold;">XGBoost</h2>
+
+
+```{r xgb_fast_earlystop, message=FALSE, warning=FALSE}
+# 1) Paralelización
+library(doParallel)
+cores <- detectCores() - 1
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+# 2) Control de entrenamiento: 5‐fold CV + búsqueda aleatoria
+library(caret)
+ctrl_rand5 <- trainControl(
+  method          = "cv",
+  number          = 5,
+  search          = "random",
+  classProbs      = TRUE,
+  summaryFunction = defaultSummary,
+  allowParallel   = TRUE
+)
+
+# 3) Entrenar XGBoost con tuneLength = 15 en 5 folds
+set.seed(2025)
+xgb_rand5 <- train(
+  x         = X_train_scaled,
+  y         = y_train,
+  method    = "xgbTree",
+  metric    = "Accuracy",
+  trControl = ctrl_rand5,
+  tuneLength = 15
+)
+print(xgb_rand5)  # parámetros óptimos
+
+# 4) Obtener probabilidades en train y test
+train_probs5 <- predict(xgb_rand5, X_train_scaled, type = "prob")[, "Yes"]
+test_probs5  <- predict(xgb_rand5, X_test_scaled,  type = "prob")[, "Yes"]
+
+# 5) Buscar umbral que maximice Accuracy en TRAIN
+ths <- seq(0.1, 0.9, by = 0.01)
+train_accs5 <- sapply(ths, function(t) {
+  preds_t <- factor(ifelse(train_probs5 > t, "Yes", "No"),
+                    levels = c("No","Yes"))
+  mean(preds_t == y_train)
+})
+best_t5 <- ths[which.max(train_accs5)]
+cat("Umbral óptimo en train (5-fold):", best_t5, "\n")
+
+# 6) Evaluar en TEST con ese umbral
+preds5 <- factor(ifelse(test_probs5 > best_t5, "Yes", "No"),
+                 levels = c("No","Yes"))
+cm5    <- confusionMatrix(preds5, y_test, positive = "Yes")
+cat("Accuracy en test (5-fold + umbral entrenado):", 
+    round(cm5$overall["Accuracy"], 3), "\n")
+
+# 7) Cerrar cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+
+<h1 style="color:red;">LightGBM</h2>
+
+
+```{r model_lgb_f1, message=FALSE, warning=FALSE}
+# 1) Entrenar LGBM
+dtrain <- lgb.Dataset(as.matrix(X_train_scaled), label = as.numeric(y_train)-1)
+params <- list(objective="binary", metric="binary_logloss")
+model_lgb_acc <- lgb.train(params, dtrain, nrounds=100, verbose=-1)
+
+# 2) Umbral
+probs_lgb <- predict(model_lgb_acc, as.matrix(X_test_scaled))
+ths_lgb   <- seq(0.1,0.9,by=0.01)
+accs_lgb  <- sapply(ths_lgb, function(t){
+  preds <- factor(ifelse(probs_lgb>t,pos_lvl,"No"), levels=c("No","Yes"))
+  mean(preds==y_test)
+})
+best_t_lgb <- ths_lgb[which.max(accs_lgb)]
+cat("LGBM best threshold (Accuracy):", best_t_lgb, "\n")
+
+# 3) Métricas
+pred_lgb <- factor(ifelse(probs_lgb>best_t_lgb,pos_lvl,"No"), levels=c("No","Yes"))
+cm_lgb   <- confusionMatrix(pred_lgb, y_test, positive=pos_lvl)
+cat("Accuracy:", round(cm_lgb$overall["Accuracy"],3), "\n")
+cat("Precision:", round(cm_lgb$byClass["Pos Pred Value"],3), "\n")
+cat("Sensitivity:", round(cm_lgb$byClass["Sensitivity"],3), "\n")
+cat("F1:", round(F1_Score(y_test,pred_lgb,positive=pos_lvl),3), "\n")
+```
+
+<h2 style="color:gold;">Neural Network (MLP)</h2>
+
+
+```{r model_nnet_smote, message=FALSE, warning=FALSE} 
+# 1) Entrenar MLP optimizando Accuracy
+model_nnet_acc <- train(
+  x         = X_train_scaled,
+  y         = y_train,
+  method    = "nnet",
+  metric    = "Accuracy",
+  trControl = ctrl_acc,
+  tuneLength= 3,
+  trace     = FALSE,
+  maxit     = 1000
+)
+
+# 2) Umbral
+probs_nnet <- predict(model_nnet_acc, X_test_scaled, type="prob")[, pos_lvl]
+ths_nnet   <- seq(0.1,0.9,by=0.01)
+accs_nnet  <- sapply(ths_nnet, function(t){
+  preds <- factor(ifelse(probs_nnet>t,pos_lvl,"No"), levels=c("No","Yes"))
+  mean(preds==y_test)
+})
+best_t_nnet <- ths_nnet[which.max(accs_nnet)]
+cat("MLP best threshold (Accuracy):", best_t_nnet, "\n")
+
+# 3) Métricas
+pred_nnet <- factor(ifelse(probs_nnet>best_t_nnet,pos_lvl,"No"), levels=c("No","Yes"))
+cm_nnet   <- confusionMatrix(pred_nnet, y_test, positive=pos_lvl)
+cat("Accuracy:", round(cm_nnet$overall["Accuracy"],3), "\n")
+cat("Precision:", round(cm_nnet$byClass["Pos Pred Value"],3), "\n")
+cat("Sensitivity:", round(cm_nnet$byClass["Sensitivity"],3), "\n")
+cat("F1:", round(F1_Score(y_test,pred_nnet,positive=pos_lvl),3), "\n")
+```
+
+```
